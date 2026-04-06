@@ -2,7 +2,6 @@ import taichi as ti
 import numpy as np
 import json
 import os
-import time
 
 # Use GPU, disable unrolling limits for fast compilation of big loops
 ti.init(arch=ti.gpu, device_memory_GB=2.0)
@@ -35,6 +34,7 @@ success_time = ti.field(ti.i32, NUM_ENVS)
 
 total_progress = ti.field(ti.f32, NUM_ENVS)
 wrong_push_penalty = ti.field(ti.f32, NUM_ENVS)
+agent_contact_reward = ti.field(ti.f32, NUM_ENVS)
 
 # Weights
 w1 = ti.field(ti.f32, (NUM_ENVS, IN_DIM, HIDDEN_DIM))
@@ -68,6 +68,7 @@ def initialize_episode(difficulty: ti.f32):
         success_time[e] = EPISODE_STEPS
         total_progress[e] = 0.0
         wrong_push_penalty[e] = 0.0
+        agent_contact_reward[e] = 0.0
 
 @ti.kernel
 def update_grid():
@@ -95,13 +96,16 @@ def step(t: ti.i32):
 
             # 2. Sensors
             to_t = (target_pos[e] - obj_pos[e]).normalized()
-            to_o = (obj_pos[e] - x[e, i]).normalized()
+            d_o = (obj_pos[e] - x[e, i])
+            dist_o = d_o.norm()
+            to_o = d_o.normalized()
             rp = (x[e, i] - obj_pos[e]) / 100.0
             wl, wr = 1.0/(1.0+x[e, i].x), 1.0/(1.0+WIDTH-x[e, i].x)
             wt, wb = 1.0/(1.0+x[e, i].y), 1.0/(1.0+HEIGHT-x[e, i].y)
             
+            # Stage 1.1: distance-to-object, object velocity direction, agent density in forward cone
             inp = ti.Vector([to_t.x, to_t.y, to_o.x, to_o.y, rp.x, rp.y, v[e, i].x, v[e, i].y, 
-                             lv.x, lv.y, wl, wr, wt, wb, 0.0, 0.0, 1.0, v[e, i].norm()])
+                             lv.x, lv.y, wl, wr, wt, wb, dist_o/100.0, obj_v[e].x, obj_v[e].y, v[e, i].norm()])
             
             # 3. Brain MLP
             h1 = ti.Vector([0.0] * HIDDEN_DIM)
@@ -125,9 +129,6 @@ def step(t: ti.i32):
         if env_active[e]:
             # Agent-Agent Soft Collision
             c = (x[e, i] / 20.0).cast(ti.i32)
-            # Brute force within env for simplicity and stability if grid fails, but let's stick to grid for performance
-            # Actually, to guarantee no NaN, we add a small epsilon to distance
-            # For 100 agents, O(N^2) is tiny. Let's do brute force for perfect stability.
             for j in range(NUM_PARTICLES):
                 if i != j:
                     diff = x[e, i] - x[e, j]
@@ -156,9 +157,12 @@ def step(t: ti.i32):
                 v[e, i] += (push_f / AGENT_MASS) * DT
                 obj_v[e] -= (push_f / OBJ_MASS) * DT
                 
+                agent_contact_reward[e] += 0.01
+                
                 # Reward Shaping: Penalize counter-pushing
                 to_t = (target_pos[e] - obj_pos[e]).normalized()
-                if push_f.dot(to_t) > 0: # Agent is pushing object away from target
+                # If push_f.dot(to_t) > 0, the agent is between object and target (bad).
+                if push_f.dot(to_t) > 0: 
                     wrong_push_penalty[e] += 0.05
 
             # Agent Integration
@@ -194,6 +198,13 @@ def step(t: ti.i32):
                 env_success[e] = 1
                 success_time[e] = t
 
+def load_weights(population):
+    w1.from_numpy(population[:, :IN_DIM*HIDDEN_DIM].reshape(NUM_ENVS, IN_DIM, HIDDEN_DIM))
+    ptr = IN_DIM*HIDDEN_DIM
+    b1.from_numpy(population[:, ptr:ptr+HIDDEN_DIM]); ptr += HIDDEN_DIM
+    w2.from_numpy(population[:, ptr:ptr+HIDDEN_DIM*OUT_DIM].reshape(NUM_ENVS, HIDDEN_DIM, OUT_DIM)); ptr += HIDDEN_DIM*OUT_DIM
+    b2.from_numpy(population[:, ptr:ptr+OUT_DIM])
+
 def export_policy(weights, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     ptr = 0
@@ -204,93 +215,13 @@ def export_policy(weights, path):
     with open(path, "w") as f: 
         json.dump({"W1": w1_v, "b1": b1_v, "W2": w2_v, "b2": b2_v}, f)
 
-def train_openai_es():
-    print(f"STARTING OPENAI-ES SELF-CORRECTING MARATHON: {NUM_ENVS} ENVS")
+def get_fitness():
+    reached = env_success.to_numpy()
+    t_bonus = (EPISODE_STEPS - success_time.to_numpy()) * 2.0
+    prog = total_progress.to_numpy() * 100.0
+    penalty = wrong_push_penalty.to_numpy() * 20.0
+    contact = agent_contact_reward.to_numpy() * 0.5
+    dist_final = np.linalg.norm(obj_pos.to_numpy() - target_pos.to_numpy(), axis=1)
     
-    weights = np.random.randn(PARAM_COUNT).astype(np.float32) * 0.1
-    
-    # Adam Optimizer State
-    m = np.zeros(PARAM_COUNT, dtype=np.float32)
-    v = np.zeros(PARAM_COUNT, dtype=np.float32)
-    beta1, beta2 = 0.9, 0.999
-    lr = 0.05
-    sigma = 0.1 # Noise std dev
-    
-    best_all_time_fit = -999999.0
-    plateau_counter = 0
-    difficulty = 0.0
-
-    for gen in range(1, 50001):
-        # Auto-Curriculum
-        if gen % 500 == 0 and difficulty < 1.0:
-            difficulty += 0.1
-            print(f">>> Difficulty Increased to {difficulty:.2f} <<<")
-
-        # Generate Population (Mirroring for OpenAI-ES variance reduction)
-        half_pop = NUM_ENVS // 2
-        epsilon = np.random.randn(half_pop, PARAM_COUNT).astype(np.float32)
-        noise_matrix = np.vstack([epsilon, -epsilon]) # Shape: (NUM_ENVS, PARAM_COUNT)
-        population = weights + sigma * noise_matrix
-        
-        # Load weights into Taichi fields
-        w1.from_numpy(population[:, :IN_DIM*HIDDEN_DIM].reshape(NUM_ENVS, IN_DIM, HIDDEN_DIM))
-        ptr = IN_DIM*HIDDEN_DIM
-        b1.from_numpy(population[:, ptr:ptr+HIDDEN_DIM]); ptr += HIDDEN_DIM
-        w2.from_numpy(population[:, ptr:ptr+HIDDEN_DIM*OUT_DIM].reshape(NUM_ENVS, HIDDEN_DIM, OUT_DIM)); ptr += HIDDEN_DIM*OUT_DIM
-        b2.from_numpy(population[:, ptr:ptr+OUT_DIM])
-
-        initialize_episode(difficulty)
-        for t in range(EPISODE_STEPS):
-            update_grid()
-            step(t)
-        
-        # Calculate Fitness
-        reached = env_success.to_numpy()
-        t_bonus = (EPISODE_STEPS - success_time.to_numpy()) * 2.0
-        prog = total_progress.to_numpy() * 100.0
-        penalty = wrong_push_penalty.to_numpy() * 20.0
-        dist_final = np.linalg.norm(obj_pos.to_numpy() - target_pos.to_numpy(), axis=1)
-        
-        fitness = reached * 5000.0 + t_bonus + prog - penalty - dist_final * 5.0
-        
-        # Rank-based fitness transformation (standard practice for ES to prevent explosion)
-        order = np.argsort(fitness)[::-1]
-        ranks = np.zeros(NUM_ENVS, dtype=np.float32)
-        ranks[order] = np.linspace(0.5, -0.5, NUM_ENVS)
-        
-        # Gradient Estimate: grad = 1/(N*sigma) * sum(rank * noise)
-        gradient = (1.0 / (NUM_ENVS * sigma)) * np.dot(ranks, noise_matrix)
-        
-        # Adam Update
-        m = beta1 * m + (1.0 - beta1) * gradient
-        v = beta2 * v + (1.0 - beta2) * (gradient ** 2)
-        m_hat = m / (1.0 - beta1**gen)
-        v_hat = v / (1.0 - beta2**gen)
-        weights = weights + lr * m_hat / (np.sqrt(v_hat) + 1e-8)
-        
-        # Logging & Checkpointing
-        max_fit = np.max(fitness)
-        success_count = np.sum(reached)
-        
-        if max_fit > best_all_time_fit:
-            best_all_time_fit = max_fit
-            plateau_counter = 0
-        else:
-            plateau_counter += 1
-
-        if gen % 100 == 0:
-            print(f"Gen {gen:05d} | Max Fit: {max_fit:.1f} | Success: {success_count}/{NUM_ENVS} | LR: {lr:.4f} | Sig: {sigma:.3f}")
-            export_policy(weights, "web/public/policy.json")
-
-        # Plateau Detection (Self-Correction)
-        if plateau_counter > 200:
-            print(f">>> Plateau Detected. Decaying LR, Injecting Noise. <<<")
-            lr = max(0.005, lr * 0.8)
-            sigma = min(0.3, sigma * 1.2)
-            plateau_counter = 0
-            
-    print("MARATHON COMPLETE.")
-    export_policy(weights, "web/public/policy.json")
-
-if __name__ == "__main__": 
-    train_openai_es()
+    fitness = reached * 5000.0 + t_bonus + prog + contact - penalty - dist_final * 5.0
+    return fitness, reached

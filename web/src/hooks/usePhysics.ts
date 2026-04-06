@@ -32,6 +32,7 @@ export const usePhysics = () => {
   const objPosRef = useRef<{x: number, y: number, vx: number, vy: number}>({ x: 400, y: 250, vx: 0, vy: 0 });
   const targetRef = useRef<Vector | null>(null);
   const policyRef = useRef<any>(null);
+  const trailRef = useRef<Vector[]>([]);
 
   useEffect(() => {
     // 1. Init
@@ -47,7 +48,6 @@ export const usePhysics = () => {
     agentsRef.current = initialAgents;
 
     // 2. Load
-    console.log("Marathon OpenAI-ES Policy Bundled & Loaded");
     policyRef.current = policyData;
     setBrainActive(true);
 
@@ -62,15 +62,47 @@ export const usePhysics = () => {
         const policy = policyRef.current;
 
         if (target && policy && !success) {
-            // Local Consensus
-            let avgVX = 0, avgVY = 0;
-            agentsRef.current.forEach(a => { avgVX += a.vx; avgVY += a.vy; });
-            avgVX /= 100; avgVY /= 100;
+            // Local Consensus (Grid-based 1:1 Parity)
+            const gridVX = new Float32Array(40 * 40);
+            const gridVY = new Float32Array(40 * 40);
+            const gridCount = new Int32Array(40 * 40);
+            agentsRef.current.forEach(a => {
+                const gx = Math.max(0, Math.min(39, Math.floor(a.x / 20)));
+                const gy = Math.max(0, Math.min(39, Math.floor(a.y / 20)));
+                const idx = gx + gy * 40;
+                gridVX[idx] += a.vx;
+                gridVY[idx] += a.vy;
+                gridCount[idx]++;
+            });
+
+            // Trail
+            trailRef.current.push({ x: obj.x, y: obj.y });
+            if (trailRef.current.length > 300) trailRef.current.shift();
 
             agentsRef.current.forEach((agent) => {
+                // Get local average from 3x3 grid cells (Parity with engine.py)
+                const gx = Math.max(0, Math.min(39, Math.floor(agent.x / 20)));
+                const gy = Math.max(0, Math.min(39, Math.floor(agent.y / 20)));
+                let sumVX = 0, sumVY = 0, count = 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nx = gx + dx, ny = gy + dy;
+                        if (nx >= 0 && nx < 40 && ny >= 0 && ny < 40) {
+                            const idx = nx + ny * 40;
+                            sumVX += gridVX[idx];
+                            sumVY += gridVY[idx];
+                            count += gridCount[idx];
+                        }
+                    }
+                }
+                const avgVX = count > 0 ? sumVX / count : 0;
+                const avgVY = count > 0 ? sumVY / count : 0;
+
                 // Sensors
                 const toT = normalize({ x: target.x - obj.x, y: target.y - obj.y });
-                const toO = normalize({ x: obj.x - agent.x, y: obj.y - agent.y });
+                const dO = { x: obj.x - agent.x, y: obj.y - agent.y };
+                const distO = Math.sqrt(dO.x * dO.x + dO.y * dO.y);
+                const toO = normalize(dO);
                 const rp = { x: (agent.x - obj.x) / 100.0, y: (agent.y - obj.y) / 100.0 };
                 
                 const wL = 1.0 / (1.0 + agent.x);
@@ -81,7 +113,7 @@ export const usePhysics = () => {
                 const inpCorrect = [
                     toT.x, toT.y, toO.x, toO.y, rp.x, rp.y, agent.vx, agent.vy, avgVX, avgVY,
                     wL, wR, wT, wB, 
-                    0.0, 0.0, 1.0, Math.sqrt(agent.vx*agent.vx + agent.vy*agent.vy)
+                    distO / 100.0, obj.vx, obj.vy, Math.sqrt(agent.vx*agent.vx + agent.vy*agent.vy)
                 ];
 
                 // Inference (18 -> 64 -> 2)
@@ -100,6 +132,7 @@ export const usePhysics = () => {
 
                 // Physics (Force)
                 agent.vx += (outX * 0.02 / AGENT_MASS) * DT;
+                agent.vy += (outY * 0.02 / AGENT_MASS) * DT;
             });
 
             // Physics (Hooke's Law Soft Contacts)
@@ -132,8 +165,10 @@ export const usePhysics = () => {
                     }
                     a.vx += (fx / AGENT_MASS) * DT; a.vy += (fy / AGENT_MASS) * DT;
                     obj.vx -= (fx / OBJ_MASS) * DT; obj.vy -= (fy / OBJ_MASS) * DT;
-                }
 
+                    // Parity Note: engine.py penalizes push_f.dot(to_t) > 0 (agent in front)
+                    // We don't have a fitness field in JS, but we keep the physics logic identical.
+                    }
                 // Agent Integration
                 a.vx *= (1.0 - FRICTION_AIR);
                 a.vy *= (1.0 - FRICTION_AIR);
@@ -166,6 +201,20 @@ export const usePhysics = () => {
 
         // RENDER
         ctx.clearRect(0, 0, WIDTH, HEIGHT);
+
+        // Trail (Phase 1 Visual Upgrade)
+        if (trailRef.current.length > 1) {
+            ctx.beginPath();
+            ctx.strokeStyle = '#fdba74'; ctx.lineWidth = 1;
+            ctx.setLineDash([5, 5]);
+            ctx.moveTo(trailRef.current[0].x, trailRef.current[0].y);
+            for (let i = 1; i < trailRef.current.length; i++) {
+                ctx.lineTo(trailRef.current[i].x, trailRef.current[i].y);
+            }
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
         // Target
         if (target) {
             ctx.fillStyle = success ? '#22c55e' : '#f97316';
@@ -187,11 +236,16 @@ export const usePhysics = () => {
     return () => cancelAnimationFrame(animationId);
   }, [success]);
 
-  const setTarget = (x: number, y: number) => { targetRef.current = { x, y }; setSuccess(false); };
+  const setTarget = (x: number, y: number) => { 
+      targetRef.current = { x, y }; 
+      setSuccess(false); 
+      trailRef.current = [];
+  };
   const resetEnv = () => {
       objPosRef.current = { x: 400, y: 250, vx: 0, vy: 0 };
       setSuccess(false);
       targetRef.current = null;
+      trailRef.current = [];
   };
 
   return { canvasRef, setTarget, resetEnv, agentCount: 100, brainActive, success };
