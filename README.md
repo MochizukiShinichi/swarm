@@ -47,3 +47,4 @@ For a deep dive into Hooke's Law penalty physics, OpenAI-ES gradient estimation,
 -   `ALGORITHM.md`: Detailed documentation of the physics and training innovations.
 -   `web/`: React + Vite web application featuring a custom Native JS physics engine for evaluating the policies.
 -   `plan.txt`: The original project vision and roadmap.
+
