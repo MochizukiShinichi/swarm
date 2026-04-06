@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import policyData from '../assets/policy.json';
 
 // --- GOLDEN PARITY CONSTANTS ---
 const WIDTH = 800.0;
@@ -46,20 +47,9 @@ export const usePhysics = () => {
     agentsRef.current = initialAgents;
 
     // 2. Load
-    const policyUrl = `${import.meta.env.BASE_URL}policy.json`;
-    fetch(policyUrl)
-      .then(res => {
-        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-        return res.json();
-      })
-      .then(data => {
-        console.log("Marathon OpenAI-ES Policy Loaded from:", policyUrl);
-        policyRef.current = data;
-        setBrainActive(true);
-      })
-      .catch(err => {
-        console.error("Failed to load OpenAI-ES Policy:", err);
-      });
+    console.log("Marathon OpenAI-ES Policy Bundled & Loaded");
+    policyRef.current = policyData;
+    setBrainActive(true);
 
     // 3. Loop
     let animationId: number;
