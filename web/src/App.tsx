@@ -3,7 +3,7 @@ import { usePhysics } from './hooks/usePhysics';
 import { Trash2, Target } from 'lucide-react';
 
 const App: React.FC = () => {
-  const { canvasRef, setTarget, resetEnv, agentCount, brainActive, success } = usePhysics();
+  const { canvasRef, setTarget, resetEnv, brainActive, success } = usePhysics();
 
   const handleMouseDown = (e: React.MouseEvent) => {
     const rect = canvasRef.current?.getBoundingClientRect();

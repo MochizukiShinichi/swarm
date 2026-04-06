@@ -70,7 +70,7 @@ export const usePhysics = () => {
             agentsRef.current.forEach(a => { avgVX += a.vx; avgVY += a.vy; });
             avgVX /= 100; avgVY /= 100;
 
-            agentsRef.current.forEach((agent, idx) => {
+            agentsRef.current.forEach((agent) => {
                 // Sensors
                 const toT = normalize({ x: target.x - obj.x, y: target.y - obj.y });
                 const toO = normalize({ x: obj.x - agent.x, y: obj.y - agent.y });
