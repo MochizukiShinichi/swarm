@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import policyData from '../../public/policy.json';
+import policyData from '../policy.json';
 
 // --- GOLDEN PARITY CONSTANTS ---
 const WIDTH = 800.0;
