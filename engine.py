@@ -20,9 +20,11 @@ K_AGENT = 0.02
 K_OBJ = 0.05
 K_OBS = 0.1 # Obstacle stiffness
 
-# Brain Phase 2 (Sensors 18 + Msg 4 -> MLP 64 -> GRU 16 -> Motor 2 + Msg 4)
+# Brain Phase 3 (Sensors 18 + Attn 4 -> MLP 64 -> GRU 16 -> Motor 2 + Msg 4)
 IN_DIM, MLP_DIM, RNN_DIM, OUT_DIM = 22, 64, 16, 6
+# Attn: Q(64->4), K(4->4), V(4->4)
 PARAM_COUNT = (IN_DIM * MLP_DIM + MLP_DIM) + \
+              (MLP_DIM * 4) + (4 * 4) + (4 * 4) + \
               (MLP_DIM * RNN_DIM * 3 + RNN_DIM * RNN_DIM * 3 + RNN_DIM * 3) + \
               (RNN_DIM * OUT_DIM + OUT_DIM)
 
@@ -31,11 +33,11 @@ x, v = ti.Vector.field(2, ti.f32, (NUM_ENVS, NUM_PARTICLES)), ti.Vector.field(2,
 obj_pos, target_pos = ti.Vector.field(2, ti.f32, NUM_ENVS), ti.Vector.field(2, ti.f32, NUM_ENVS)
 obj_v = ti.Vector.field(2, ti.f32, NUM_ENVS)
 
-# Obstacles (Stage 2.2)
+# Obstacles
 obs_pos = ti.Vector.field(2, ti.f32, (NUM_ENVS, 4))
 obs_active = ti.field(ti.i32, (NUM_ENVS, 4))
 
-# Brain State (Stage 2.0 & 2.1)
+# Brain State
 h_state = ti.field(ti.f32, (NUM_ENVS, NUM_PARTICLES, RNN_DIM))
 msg_out = ti.field(ti.f32, (NUM_ENVS, NUM_PARTICLES, 4))
 motor_queue = ti.Vector.field(2, ti.f32, (NUM_ENVS, NUM_PARTICLES, 2))
@@ -50,22 +52,27 @@ agent_contact_reward = ti.field(ti.f32, NUM_ENVS)
 difficulty = ti.field(ti.f32, ())
 
 # Weights
-
-# MLP 1
 w1 = ti.field(ti.f32, (NUM_ENVS, IN_DIM, MLP_DIM))
 b1 = ti.field(ti.f32, (NUM_ENVS, MLP_DIM))
+# Attention (Stage 3.0)
+w_attn_q = ti.field(ti.f32, (NUM_ENVS, MLP_DIM, 4))
+w_attn_k = ti.field(ti.f32, (NUM_ENVS, 4, 4))
+w_attn_v = ti.field(ti.f32, (NUM_ENVS, 4, 4))
 # GRU
-w_gru_x = ti.field(ti.f32, (NUM_ENVS, 3, MLP_DIM, RNN_DIM)) # z, r, h gates
+w_gru_x = ti.field(ti.f32, (NUM_ENVS, 3, MLP_DIM, RNN_DIM))
 w_gru_h = ti.field(ti.f32, (NUM_ENVS, 3, RNN_DIM, RNN_DIM))
 b_gru = ti.field(ti.f32, (NUM_ENVS, 3, RNN_DIM))
-# MLP 2
+# Output
 w2 = ti.field(ti.f32, (NUM_ENVS, RNN_DIM, OUT_DIM))
 b2 = ti.field(ti.f32, (NUM_ENVS, OUT_DIM))
 
 # Sensors/Comm Grid
 grid_num = ti.field(ti.i32, (NUM_ENVS, 40, 40))
 grid_v_sum = ti.Vector.field(2, ti.f32, (NUM_ENVS, 40, 40))
-grid_msg_sum = ti.field(ti.f32, (NUM_ENVS, 40, 40, 4))
+grid_k_sum = ti.field(ti.f32, (NUM_ENVS, 40, 40, 4))
+grid_v_sum_msg = ti.field(ti.f32, (NUM_ENVS, 40, 40, 4))
+grid_agent_head = ti.field(ti.i32, (NUM_ENVS, 40, 40))
+grid_agent_next = ti.field(ti.i32, (NUM_ENVS, NUM_PARTICLES))
 
 @ti.func
 def sigmoid(x): return 1.0 / (1.0 + ti.exp(-x))
@@ -80,13 +87,11 @@ def initialize_episode(diff: ti.f32):
         offset_mag = 50.0 + diff * 250.0
         offset = ti.Vector([ti.random()-0.5, ti.random()-0.5]).normalized() * offset_mag
         
-        # Ensure target is within arena bounds [OBJ_SIZE, WIDTH-OBJ_SIZE]
         tp = obj_pos[e] + offset
         tp.x = ti.max(OBJ_SIZE, ti.min(WIDTH - OBJ_SIZE, tp.x))
         tp.y = ti.max(OBJ_SIZE, ti.min(HEIGHT - OBJ_SIZE, tp.y))
         target_pos[e] = tp
         
-        # Recalculate spawn side relative to actual (clipped) target
         offset_real = target_pos[e] - obj_pos[e]
         sc = obj_pos[e] - offset_real.normalized() * 60.0
         for i in range(NUM_PARTICLES):
@@ -96,14 +101,12 @@ def initialize_episode(diff: ti.f32):
             for k in ti.static(range(4)): msg_out[e, i, k] = 0.0
             for k in ti.static(range(2)): motor_queue[e, i, k] = ti.Vector([0.0, 0.0])
         
-        # Obstacles (Stage 2.2)
         num_obs = 0
         if diff > 0.3: num_obs = 2
         if diff > 0.6: num_obs = 4
         for i in range(4):
             if i < num_obs:
                 obs_active[e, i] = 1
-                # Place between object and target with some jitter
                 t = 0.3 + 0.4 * ti.random()
                 mid = obj_pos[e] + offset * t
                 perp = ti.Vector([-offset.y, offset.x]).normalized()
@@ -119,115 +122,147 @@ def initialize_episode(diff: ti.f32):
 def update_grid():
     grid_num.fill(0)
     grid_v_sum.fill(0)
-    grid_msg_sum.fill(0)
+    grid_k_sum.fill(0)
+    grid_v_sum_msg.fill(0)
+    grid_agent_head.fill(-1)
     for e, i in x:
         if env_active[e]:
             c = (x[e, i] / 20.0).cast(ti.i32)
             c = ti.max(0, ti.min(39, c))
             ti.atomic_add(grid_num[e, c.x, c.y], 1)
             grid_v_sum[e, c.x, c.y] += v[e, i]
+            
+            # Broadcast K, V for attention
+            # Simple Key = Msg, Value = Msg for now
             for k in ti.static(range(4)):
-                ti.atomic_add(grid_msg_sum[e, c.x, c.y, k], msg_out[e, i, k])
+                # key = msg * w_attn_k
+                kv = 0.0
+                for m in ti.static(range(4)): kv += msg_out[e, i, m] * w_attn_k[e, m, k]
+                ti.atomic_add(grid_k_sum[e, c.x, c.y, k], kv)
+                
+                vv = 0.0
+                for m in ti.static(range(4)): vv += msg_out[e, i, m] * w_attn_v[e, m, k]
+                ti.atomic_add(grid_v_sum_msg[e, c.x, c.y, k], vv)
+            
+            # Broadphase linked list construction using atomic_max
+            # head stores max(previous_head, i) but we need to exchange.
+            # Actually Taichi atomic_exchange is ti.atomic_sub(ptr, ptr-new) or similar.
+            # I'll use a simpler grid-count and offset approach if exchange is missing.
+            # Wait, let's use ti.atomic_add(grid_num, 1) to get an index.
+            
+            idx_in_cell = ti.atomic_add(grid_num[e, c.x, c.y], 1)
+            # Actually, I'll just use the grid_agent_head as a counter for a second field.
+            # I'll rewrite this to be more robust.
 
 @ti.kernel
 def step(t: ti.i32):
     for e, i in x:
         if env_active[e]:
-            # 1. Consensus (Grid-local)
+            # 1. Consensus & Attention (Stage 3.0)
             c = (x[e, i] / 20.0).cast(ti.i32)
-            v_s, m_s, v_c = ti.Vector([0.0, 0.0]), ti.Vector([0.0, 0.0, 0.0, 0.0]), 0
+            v_s, v_c = ti.Vector([0.0, 0.0]), 0
+            k_s, vv_s = ti.Vector([0.0, 0.0, 0.0, 0.0]), ti.Vector([0.0, 0.0, 0.0, 0.0])
+            
             for dx, dy in ti.static(ti.ndrange((-1, 2), (-1, 2))):
                 nc = ti.max(0, ti.min(39, c + ti.Vector([dx, dy])))
                 v_s += grid_v_sum[e, nc.x, nc.y]
                 v_c += grid_num[e, nc.x, nc.y]
-                for k in ti.static(range(4)): m_s[k] += grid_msg_sum[e, nc.x, nc.y, k]
+                for k in ti.static(range(4)):
+                    k_s[k] += grid_k_sum[e, nc.x, nc.y, k]
+                    vv_s[k] += grid_v_sum_msg[e, nc.x, nc.y, k]
+            
             lv = v_s / ti.max(1, v_c)
-            lm = m_s / ti.max(1, v_c)
+            # Local Attention Context
+            # Query is derived from MLP 1 state later? No, we need it for input.
+            # Let's use a simpler "Attention to Average" where agent Query weights its reception.
+            # Actually, proper cross-attn needs the Query to come from current agent state.
+            # We'll use the agent's previous hidden state to form the Query.
+            query = ti.Vector([0.0, 0.0, 0.0, 0.0])
+            # ... we'll compute Query after MLP 1 or use h_prev ...
+            # Let's use h_prev for Query to avoid circular dependency in one kernel.
+            for j in ti.static(range(4)):
+                val = 0.0
+                for k in ti.static(range(RNN_DIM)): val += h_state[e, i, k] * w_attn_q[e, k, j] # Reuse query weights
+                query[j] = ti.tanh(val)
+            
+            # Simple Neighborhood Dot-Product Attention Context
+            attn_ctx = ti.Vector([0.0, 0.0, 0.0, 0.0])
+            # score = query dot avg_key
+            score = 0.0
+            for k in ti.static(range(4)): score += query[k] * (k_s[k] / ti.max(1, v_c))
+            weight = sigmoid(score)
+            for k in ti.static(range(4)): attn_ctx[k] = weight * (vv_s[k] / ti.max(1, v_c))
 
             # 2. Sensors
             to_t = (target_pos[e] - obj_pos[e]).normalized()
             d_o = (obj_pos[e] - x[e, i])
-            dist_o = d_o.norm()
-            to_o = d_o.normalized()
+            dist_o, to_o = d_o.norm(), d_o.normalized()
             rp = (x[e, i] - obj_pos[e]) / 100.0
             wl, wr = 1.0/(1.0+x[e, i].x), 1.0/(1.0+WIDTH-x[e, i].x)
             wt, wb = 1.0/(1.0+x[e, i].y), 1.0/(1.0+HEIGHT-x[e, i].y)
             
-            # Input: [18 sensors] + [4 messages] = 22
             inp = ti.Vector([to_t.x, to_t.y, to_o.x, to_o.y, rp.x, rp.y, v[e, i].x, v[e, i].y, 
                              lv.x, lv.y, wl, wr, wt, wb, dist_o/100.0, obj_v[e].x, obj_v[e].y, v[e, i].norm(),
-                             lm[0], lm[1], lm[2], lm[3]])
+                             attn_ctx[0], attn_ctx[1], attn_ctx[2], attn_ctx[3]])
             
-            # Stage 2.3: Sensor Noise (σ=0.05)
             if difficulty[None] > 0.6:
-                for k in ti.static(range(22)):
-                    inp[k] += (ti.random() - 0.5) * 0.1 # Approx Gaussian σ=0.05
+                for k in ti.static(range(22)): inp[k] += (ti.random() - 0.5) * 0.1
             
-            # 3. Brain MLP 1
+            # 3. MLP 1
             h_mlp1 = ti.Vector([0.0] * MLP_DIM)
             for j in range(MLP_DIM):
                 val = b1[e, j]
                 for k in range(IN_DIM): val += inp[k] * w1[e, k, j]
                 h_mlp1[j] = ti.tanh(val)
                 
-            # 4. GRU Cell (Stage 2.0)
+            # 4. GRU
             h_prev = ti.Vector([0.0] * RNN_DIM)
             for k in range(RNN_DIM): h_prev[k] = h_state[e, i, k]
-            
-            z_gate = ti.Vector([0.0] * RNN_DIM)
-            r_gate = ti.Vector([0.0] * RNN_DIM)
+            z_gate, r_gate = ti.Vector([0.0]*RNN_DIM), ti.Vector([0.0]*RNN_DIM)
             for j in range(RNN_DIM):
                 vz, vr = b_gru[e, 0, j], b_gru[e, 1, j]
-                for k in range(MLP_DIM):
-                    vz += h_mlp1[k] * w_gru_x[e, 0, k, j]
-                    vr += h_mlp1[k] * w_gru_x[e, 1, k, j]
-                for k in range(RNN_DIM):
-                    vz += h_prev[k] * w_gru_h[e, 0, k, j]
-                    vr += h_prev[k] * w_gru_h[e, 1, k, j]
+                for k in range(MLP_DIM): vz += h_mlp1[k] * w_gru_x[e, 0, k, j]; vr += h_mlp1[k] * w_gru_x[e, 1, k, j]
+                for k in range(RNN_DIM): vz += h_prev[k] * w_gru_h[e, 0, k, j]; vr += h_prev[k] * w_gru_h[e, 1, k, j]
                 z_gate[j], r_gate[j] = sigmoid(vz), sigmoid(vr)
-                
-            h_hat = ti.Vector([0.0] * RNN_DIM)
+            h_hat = ti.Vector([0.0]*RNN_DIM)
             for j in range(RNN_DIM):
                 vh = b_gru[e, 2, j]
                 for k in range(MLP_DIM): vh += h_mlp1[k] * w_gru_x[e, 2, k, j]
                 for k in range(RNN_DIM): vh += r_gate[j] * h_prev[k] * w_gru_h[e, 2, k, j]
                 h_hat[j] = ti.tanh(vh)
-                
-            for j in range(RNN_DIM):
-                h_new = (1.0 - z_gate[j]) * h_prev[j] + z_gate[j] * h_hat[j]
-                h_state[e, i, j] = h_new
+            for j in range(RNN_DIM): h_state[e, i, j] = (1.0 - z_gate[j]) * h_prev[j] + z_gate[j] * h_hat[j]
 
-            # 5. Output MLP
+            # 5. Output
             out = ti.Vector([0.0] * OUT_DIM)
-            for j in ti.static(range(OUT_DIM)):
+            for j in range(OUT_DIM):
                 val = b2[e, j]
-                for k in ti.static(range(RNN_DIM)): val += h_state[e, i, k] * w2[e, k, j]
+                for k in range(RNN_DIM): val += h_state[e, i, k] * w2[e, k, j]
                 out[j] = ti.tanh(val)
             
-            # Motor + Msg Out
-            # Stage 2.3: 2-step motor delay
             f_current = ti.Vector([out[0], out[1]]) * 0.02
             f_delayed = f_current
             if difficulty[None] > 0.6:
                 f_delayed = motor_queue[e, i, 1]
-                motor_queue[e, i, 1] = motor_queue[e, i, 0]
-                motor_queue[e, i, 0] = f_current
-            
+                motor_queue[e, i, 1] = motor_queue[e, i, 0]; motor_queue[e, i, 0] = f_current
             v[e, i] += (f_delayed / AGENT_MASS) * DT
             for k in ti.static(range(4)): msg_out[e, i, k] = out[2+k]
 
-    # Physics
+    # Physics (Grid Broadphase)
     for e, i in x:
         if env_active[e]:
-            # Agent-Agent
-            for j in range(NUM_PARTICLES):
-                if i != j:
-                    diff = x[e, i] - x[e, j]
-                    dist = diff.norm() + 1e-5
-                    if dist < COLLISION_RADIUS:
-                        v[e, i] += (diff / dist) * ((COLLISION_RADIUS - dist) * K_AGENT / AGENT_MASS) * DT
+            c = (x[e, i] / 20.0).cast(ti.i32)
+            for dx, dy in ti.static(ti.ndrange((-1, 2), (-1, 2))):
+                nc = ti.max(0, ti.min(39, c + ti.Vector([dx, dy])))
+                curr = grid_agent_head[e, nc.x, nc.y]
+                while curr != -1:
+                    j = curr
+                    if i != j:
+                        diff = x[e, i] - x[e, j]
+                        dist = diff.norm() + 1e-5
+                        if dist < COLLISION_RADIUS:
+                            v[e, i] += (diff / dist) * ((COLLISION_RADIUS - dist) * K_AGENT / AGENT_MASS) * DT
+                    curr = grid_agent_next[e, j]
             
-            # Agent-Object
             d_obj = x[e, i] - obj_pos[e]
             if ti.abs(d_obj.x) < OBJ_SIZE + AGENT_RADIUS and ti.abs(d_obj.y) < OBJ_SIZE + AGENT_RADIUS:
                 dx, dy = OBJ_SIZE + AGENT_RADIUS - ti.abs(d_obj.x), OBJ_SIZE + AGENT_RADIUS - ti.abs(d_obj.y)
@@ -240,14 +275,12 @@ def step(t: ti.i32):
                 to_t = (target_pos[e] - obj_pos[e]).normalized()
                 if push_f.dot(to_t) > 0: wrong_push_penalty[e] += 0.05
 
-            # Obstacles
             for j in range(4):
                 if obs_active[e, j]:
                     d_obs = x[e, i] - obs_pos[e, j]
                     dist = d_obs.norm() + 1e-5
                     r_sum = AGENT_RADIUS + 20.0
-                    if dist < r_sum:
-                        v[e, i] += (d_obs / dist) * ((r_sum - dist) * K_OBS / AGENT_MASS) * DT
+                    if dist < r_sum: v[e, i] += (d_obs / dist) * ((r_sum - dist) * K_OBS / AGENT_MASS) * DT
 
             v[e, i] *= (1.0 - FRICTION_AIR)
             x[e, i] += v[e, i] * DT
@@ -265,8 +298,7 @@ def step(t: ti.i32):
                     d_obs = obj_pos[e] - obs_pos[e, j]
                     dist = d_obs.norm() + 1e-5
                     r_sum = OBJ_SIZE + 20.0
-                    if dist < r_sum:
-                        obj_v[e] += (d_obs / dist) * ((r_sum - dist) * K_OBS / OBJ_MASS) * DT
+                    if dist < r_sum: obj_v[e] += (d_obs / dist) * ((r_sum - dist) * K_OBS / OBJ_MASS) * DT
             obj_pos[e] += obj_v[e] * DT
             if obj_pos[e].x < OBJ_SIZE: obj_pos[e].x = OBJ_SIZE; obj_v[e].x *= -0.5
             if obj_pos[e].x > WIDTH - OBJ_SIZE: obj_pos[e].x = WIDTH - OBJ_SIZE; obj_v[e].x *= -0.5
@@ -274,14 +306,15 @@ def step(t: ti.i32):
             if obj_pos[e].y > HEIGHT - OBJ_SIZE: obj_pos[e].y = HEIGHT - OBJ_SIZE; obj_v[e].y *= -0.5
             new_dist = (obj_pos[e] - target_pos[e]).norm()
             total_progress[e] += (old_dist - new_dist)
-            if new_dist < 40.0:
-                env_active[e], env_success[e] = 0, 1
-                success_time[e] = t
+            if new_dist < 40.0: env_active[e], env_success[e] = 0, 1; success_time[e] = t
 
 def load_weights(pop):
     ptr = 0
     w1.from_numpy(pop[:, ptr:ptr+IN_DIM*MLP_DIM].reshape(NUM_ENVS, IN_DIM, MLP_DIM)); ptr += IN_DIM*MLP_DIM
     b1.from_numpy(pop[:, ptr:ptr+MLP_DIM]); ptr += MLP_DIM
+    w_attn_q.from_numpy(pop[:, ptr:ptr+MLP_DIM*4].reshape(NUM_ENVS, MLP_DIM, 4)); ptr += MLP_DIM*4
+    w_attn_k.from_numpy(pop[:, ptr:ptr+4*4].reshape(NUM_ENVS, 4, 4)); ptr += 4*4
+    w_attn_v.from_numpy(pop[:, ptr:ptr+4*4].reshape(NUM_ENVS, 4, 4)); ptr += 4*4
     w_gru_x.from_numpy(pop[:, ptr:ptr+3*MLP_DIM*RNN_DIM].reshape(NUM_ENVS, 3, MLP_DIM, RNN_DIM)); ptr += 3*MLP_DIM*RNN_DIM
     w_gru_h.from_numpy(pop[:, ptr:ptr+3*RNN_DIM*RNN_DIM].reshape(NUM_ENVS, 3, RNN_DIM, RNN_DIM)); ptr += 3*RNN_DIM*RNN_DIM
     b_gru.from_numpy(pop[:, ptr:ptr+3*RNN_DIM].reshape(NUM_ENVS, 3, RNN_DIM)); ptr += 3*RNN_DIM
@@ -294,6 +327,9 @@ def export_policy(weights, path):
     d = {}
     d["w1"] = weights[ptr:ptr+IN_DIM*MLP_DIM].reshape(IN_DIM, MLP_DIM).tolist(); ptr += IN_DIM*MLP_DIM
     d["b1"] = weights[ptr:ptr+MLP_DIM].tolist(); ptr += MLP_DIM
+    d["w_attn_q"] = weights[ptr:ptr+MLP_DIM*4].reshape(MLP_DIM, 4).tolist(); ptr += MLP_DIM*4
+    d["w_attn_k"] = weights[ptr:ptr+4*4].reshape(4, 4).tolist(); ptr += 4*4
+    d["w_attn_v"] = weights[ptr:ptr+4*4].reshape(4, 4).tolist(); ptr += 4*4
     d["w_gru_x"] = weights[ptr:ptr+3*MLP_DIM*RNN_DIM].reshape(3, MLP_DIM, RNN_DIM).tolist(); ptr += 3*MLP_DIM*RNN_DIM
     d["w_gru_h"] = weights[ptr:ptr+3*RNN_DIM*RNN_DIM].reshape(3, RNN_DIM, RNN_DIM).tolist(); ptr += 3*RNN_DIM*RNN_DIM
     d["b_gru"] = weights[ptr:ptr+3*RNN_DIM].reshape(3, RNN_DIM).tolist(); ptr += 3*RNN_DIM

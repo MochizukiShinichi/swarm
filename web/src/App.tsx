@@ -59,9 +59,16 @@ const App: React.FC = () => {
         </div>
       </div>
 
-      <div className="absolute bottom-6 text-[10px] text-slate-500 uppercase tracking-widest pointer-events-none flex gap-8">
-        <span>Master Success-Aware Policy Active</span>
-        {success ? <span className="text-green-400">Target Reached - Swarm Powering Down</span> : <span>Click anywhere to set mission target</span>}
+      <div className="absolute bottom-6 text-[10px] text-slate-500 uppercase tracking-widest pointer-events-none flex flex-col items-center gap-2">
+        <div className="flex gap-8">
+            <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-[#fb7185]"></div><span>Pusher</span></div>
+            <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-[#facc15]"></div><span>Scout</span></div>
+            <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-[#22d3ee]"></div><span>Relay</span></div>
+        </div>
+        <div className="flex gap-8">
+            <span>Master Success-Aware Policy Active</span>
+            {success ? <span className="text-green-400">Target Reached - Swarm Powering Down</span> : <span>Click anywhere to set mission target</span>}
+        </div>
       </div>
     </div>
   );

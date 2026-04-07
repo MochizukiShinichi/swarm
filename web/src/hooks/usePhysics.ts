@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import policyData from '../policy.json';
 
 // --- GOLDEN PARITY CONSTANTS ---
 const WIDTH = 800.0;
@@ -34,7 +33,8 @@ export const usePhysics = () => {
   // State
   const agentsRef = useRef<{
       x: number, y: number, vx: number, vy: number, 
-      h: number[], msg: number[], motorQueue: Vector[]
+      h: number[], msg: number[], motorQueue: Vector[],
+      roleColor: string
   }[]>([]);
   const objPosRef = useRef<{x: number, y: number, vx: number, vy: number}>({ x: 400, y: 250, vx: 0, vy: 0 });
   const obstaclesRef = useRef<{x: number, y: number, active: boolean}[]>([]);
@@ -42,15 +42,16 @@ export const usePhysics = () => {
   const policyRef = useRef<any>(null);
   const trailRef = useRef<Vector[]>([]);
 
-  // Load Policy from public/policy.json (Live parity)
+  // Load Policy
   useEffect(() => {
-    try {
-      policyRef.current = policyData;
-      setBrainActive(true);
-      console.log("Phase 2 Policy Loaded via Import");
-    } catch (err) {
-      console.error("Failed to load policy data.", err);
-    }
+    fetch('policy.json')
+      .then(r => r.json())
+      .then(data => {
+          policyRef.current = data;
+          setBrainActive(true);
+          console.log("Phase 3 Policy (Attention) Loaded");
+      })
+      .catch(err => console.error("Failed to load policy.json", err));
   }, []);
 
   useEffect(() => {
@@ -64,7 +65,8 @@ export const usePhysics = () => {
             vx: 0, vy: 0,
             h: new Array(16).fill(0),
             msg: new Array(4).fill(0),
-            motorQueue: [{x:0, y:0}, {x:0, y:0}]
+            motorQueue: [{x:0, y:0}, {x:0, y:0}],
+            roleColor: '#22d3ee'
         });
     }
     agentsRef.current = initialAgents;
@@ -74,10 +76,7 @@ export const usePhysics = () => {
     let animationId: number;
     const loop = () => {
         const ctx = canvasRef.current?.getContext('2d');
-        if (!ctx) {
-            animationId = requestAnimationFrame(loop);
-            return;
-        }
+        if (!ctx) { animationId = requestAnimationFrame(loop); return; }
 
         const obj = objPosRef.current;
         const target = targetRef.current;
@@ -85,23 +84,39 @@ export const usePhysics = () => {
         const obstacles = obstaclesRef.current;
 
         if (target && policy && !successRef.current) {
-            // Local Consensus
+            // Local Consensus (Grid Parity)
             const gridVX = new Float32Array(40 * 40);
             const gridVY = new Float32Array(40 * 40);
-            const gridMsg = new Float32Array(40 * 40 * 4);
+            const gridK = new Float32Array(40 * 40 * 4);
+            const gridV = new Float32Array(40 * 40 * 4);
             const gridCount = new Int32Array(40 * 40);
+            const gridAgentHead = new Int32Array(40 * 40).fill(-1);
+            const gridAgentNext = new Int32Array(100);
             
-            agentsRef.current.forEach(a => {
+            agentsRef.current.forEach((a, i) => {
                 const gx = Math.max(0, Math.min(39, Math.floor(a.x / 20)));
                 const gy = Math.max(0, Math.min(39, Math.floor(a.y / 20)));
                 const idx = gx * 40 + gy;
-                gridVX[idx] += a.vx;
-                gridVY[idx] += a.vy;
+                
+                gridVX[idx] += a.vx; gridVY[idx] += a.vy;
                 gridCount[idx]++;
-                for (let k = 0; k < 4; k++) gridMsg[idx * 4 + k] += a.msg[k];
+                
+                // Broadcast K, V (Stage 3.0)
+                for (let k = 0; k < 4; k++) {
+                    let kv = 0, vv = 0;
+                    for (let m = 0; m < 4; m++) {
+                        kv += a.msg[m] * policy.w_attn_k[m][k];
+                        vv += a.msg[m] * policy.w_attn_v[m][k];
+                    }
+                    gridK[idx * 4 + k] += kv;
+                    gridV[idx * 4 + k] += vv;
+                }
+                
+                // Linked List for Broadphase
+                gridAgentNext[i] = gridAgentHead[idx];
+                gridAgentHead[idx] = i;
             });
 
-            // Trail
             trailRef.current.push({ x: obj.x, y: obj.y });
             if (trailRef.current.length > 300) trailRef.current.shift();
 
@@ -109,23 +124,36 @@ export const usePhysics = () => {
                 const gx = Math.max(0, Math.min(39, Math.floor(agent.x / 20)));
                 const gy = Math.max(0, Math.min(39, Math.floor(agent.y / 20)));
                 let sumVX = 0, sumVY = 0, count = 0;
-                let sumMsg = [0, 0, 0, 0];
+                let sumK = [0,0,0,0], sumV = [0,0,0,0];
                 
                 for (let dy = -1; dy <= 1; dy++) {
                     for (let dx = -1; dx <= 1; dx++) {
                         const nx = gx + dx, ny = gy + dy;
                         if (nx >= 0 && nx < 40 && ny >= 0 && ny < 40) {
                             const idx = nx * 40 + ny;
-                            sumVX += gridVX[idx];
-                            sumVY += gridVY[idx];
+                            sumVX += gridVX[idx]; sumVY += gridVY[idx];
                             count += gridCount[idx];
-                            for (let k = 0; k < 4; k++) sumMsg[k] += gridMsg[idx * 4 + k];
+                            for (let k = 0; k < 4; k++) {
+                                sumK[k] += gridK[idx * 4 + k];
+                                sumV[k] += gridV[idx * 4 + k];
+                            }
                         }
                     }
                 }
                 const avgVX = count > 0 ? sumVX / count : 0;
                 const avgVY = count > 0 ? sumVY / count : 0;
-                const avgMsg = sumMsg.map(m => count > 0 ? m / count : 0);
+                
+                // Attention Context (Stage 3.0)
+                let query = [0,0,0,0];
+                for (let j = 0; j < 4; j++) {
+                    let val = 0;
+                    for (let k = 0; k < 16; k++) val += agent.h[k] * policy.w_attn_q[k][j];
+                    query[j] = Math.tanh(val);
+                }
+                let score = 0;
+                for (let k = 0; k < 4; k++) score += query[k] * (sumK[k] / Math.max(1, count));
+                const weight = sigmoid(score);
+                const attnCtx = sumV.map(v => weight * (v / Math.max(1, count)));
 
                 // Sensors
                 const toT = normalize({ x: target.x - obj.x, y: target.y - obj.y });
@@ -140,7 +168,7 @@ export const usePhysics = () => {
                     toT.x, toT.y, toO.x, toO.y, rp.x, rp.y, agent.vx, agent.vy, avgVX, avgVY,
                     wL, wR, wT, wB, 
                     distO / 100.0, obj.vx, obj.vy, Math.sqrt(agent.vx*agent.vx + agent.vy*agent.vy),
-                    avgMsg[0], avgMsg[1], avgMsg[2], avgMsg[3]
+                    attnCtx[0], attnCtx[1], attnCtx[2], attnCtx[3]
                 ];
 
                 // Inference
@@ -170,10 +198,7 @@ export const usePhysics = () => {
                     for (let k = 0; k < 16; k++) vh += r_gate[j] * agent.h[k] * policy.w_gru_h[2][k][j];
                     h_hat.push(Math.tanh(vh));
                 }
-                for (let j = 0; j < 16; j++) {
-                    const nextH = (1.0 - z_gate[j]) * agent.h[j] + z_gate[j] * h_hat[j];
-                    agent.h[j] = isNaN(nextH) ? 0 : nextH;
-                }
+                for (let j = 0; j < 16; j++) agent.h[j] = (1.0 - z_gate[j]) * agent.h[j] + z_gate[j] * h_hat[j];
 
                 const out = [];
                 for (let j = 0; j < 6; j++) {
@@ -182,29 +207,50 @@ export const usePhysics = () => {
                     out.push(Math.tanh(val));
                 }
 
+                // Color-code by role (Phase 3 Visual Upgrade)
+                // We use msg[0] magnitude to distinguish roles
+                const activity = Math.abs(out[2]);
+                if (activity > 0.6) agent.roleColor = '#fb7185'; // Pusher (High signal)
+                else if (activity > 0.3) agent.roleColor = '#facc15'; // Scout (Medium signal)
+                else agent.roleColor = '#22d3ee'; // Relay (Low signal)
+
                 const fCurrent = { x: out[0] * 0.02, y: out[1] * 0.02 };
                 const fDelayed = agent.motorQueue[1];
-                agent.motorQueue[1] = agent.motorQueue[0];
-                agent.motorQueue[0] = fCurrent;
+                agent.motorQueue[1] = agent.motorQueue[0]; agent.motorQueue[0] = fCurrent;
                 agent.vx += (fDelayed.x / AGENT_MASS) * DT;
                 agent.vy += (fDelayed.y / AGENT_MASS) * DT;
                 for (let k = 0; k < 4; k++) agent.msg[k] = out[2+k];
             });
 
-            // Physics
+            // Physics (Grid Broadphase Parity)
             for (let i = 0; i < 100; i++) {
                 const a = agentsRef.current[i];
-                for (let j = i + 1; j < 100; j++) {
-                    const b = agentsRef.current[j];
-                    const dx = a.x - b.x, dy = a.y - b.y;
-                    const d = Math.sqrt(dx*dx + dy*dy) + 1e-5;
-                    if (d < COLLISION_RADIUS) {
-                        const pushF = (COLLISION_RADIUS - d) * K_AGENT;
-                        const fx = (dx/d) * pushF, fy = (dy/d) * pushF;
-                        a.vx += (fx / AGENT_MASS) * DT; a.vy += (fy / AGENT_MASS) * DT;
-                        b.vx -= (fx / AGENT_MASS) * DT; b.vy -= (fy / AGENT_MASS) * DT;
+                const gx = Math.max(0, Math.min(39, Math.floor(a.x / 20)));
+                const gy = Math.max(0, Math.min(39, Math.floor(a.y / 20)));
+                
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nx = gx + dx, ny = gy + dy;
+                        if (nx >= 0 && nx < 40 && ny >= 0 && ny < 40) {
+                            let curr = gridAgentHead[nx * 40 + ny];
+                            while (curr !== -1) {
+                                const j = curr;
+                                if (i !== j) {
+                                    const b = agentsRef.current[j];
+                                    const dx_ = a.x - b.x, dy_ = a.y - b.y;
+                                    const d = Math.sqrt(dx_*dx_ + dy_*dy_) + 1e-5;
+                                    if (d < COLLISION_RADIUS) {
+                                        const pushF = (COLLISION_RADIUS - d) * K_AGENT;
+                                        a.vx += (dx_/d * pushF / AGENT_MASS) * DT;
+                                        a.vy += (dy_/d * pushF / AGENT_MASS) * DT;
+                                    }
+                                }
+                                curr = gridAgentNext[j];
+                            }
+                        }
                     }
                 }
+                
                 const odx = a.x - obj.x, ody = a.y - obj.y;
                 if (Math.abs(odx) < OBJ_SIZE + AGENT_RADIUS && Math.abs(ody) < OBJ_SIZE + AGENT_RADIUS) {
                     const px = OBJ_SIZE + AGENT_RADIUS - Math.abs(odx), py = OBJ_SIZE + AGENT_RADIUS - Math.abs(ody);
@@ -215,12 +261,12 @@ export const usePhysics = () => {
                 }
                 obstacles.forEach(obs => {
                     if (obs.active) {
-                        const dx = a.x - obs.x, dy = a.y - obs.y;
-                        const d = Math.sqrt(dx*dx + dy*dy) + 1e-5;
+                        const dx_ = a.x - obs.x, dy_ = a.y - obs.y;
+                        const d = Math.sqrt(dx_*dx_ + dy_*dy_) + 1e-5;
                         const rSum = AGENT_RADIUS + 20.0;
                         if (d < rSum) {
                             const pushF = (rSum - d) * K_OBS;
-                            a.vx += (dx/d * pushF / AGENT_MASS) * DT; a.vy += (dy/d * pushF / AGENT_MASS) * DT;
+                            a.vx += (dx_/d * pushF / AGENT_MASS) * DT; a.vy += (dy_/d * pushF / AGENT_MASS) * DT;
                         }
                     }
                 });
@@ -232,12 +278,12 @@ export const usePhysics = () => {
             obj.vx *= (1.0 - FRICTION_AIR); obj.vy *= (1.0 - FRICTION_AIR);
             obstacles.forEach(obs => {
                 if (obs.active) {
-                    const dx = obj.x - obs.x, dy = obj.y - obs.y;
-                    const d = Math.sqrt(dx*dx + dy*dy) + 1e-5;
+                    const dx_ = obj.x - obs.x, dy_ = obj.y - obs.y;
+                    const d = Math.sqrt(dx_*dx_ + dy_*dy_) + 1e-5;
                     const rSum = OBJ_SIZE + 20.0;
                     if (d < rSum) {
                         const pushF = (rSum - d) * K_OBS;
-                        obj.vx += (dx/d * pushF / OBJ_MASS) * DT; obj.vy += (dy/d * pushF / OBJ_MASS) * DT;
+                        obj.vx += (dx_/d * pushF / OBJ_MASS) * DT; obj.vy += (dy_/d * pushF / OBJ_MASS) * DT;
                     }
                 }
             });
@@ -267,19 +313,12 @@ export const usePhysics = () => {
         }
         ctx.strokeStyle = successRef.current ? '#22c55e' : '#fb923c'; ctx.lineWidth = 3;
         ctx.strokeRect(obj.x - OBJ_SIZE, obj.y - OBJ_SIZE, OBJ_SIZE*2, OBJ_SIZE*2);
-        ctx.strokeStyle = 'rgba(34, 211, 238, 0.1)'; ctx.lineWidth = 0.5;
-        agentsRef.current.forEach((a, i) => {
-            if (i % 5 === 0) {
-                agentsRef.current.forEach((b, j) => {
-                    if (i < j && j % 10 === 0) {
-                        const d = Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2);
-                        if (d < 60) { ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); }
-                    }
-                });
-            }
+        
+        // Agents (Color-coded by Role)
+        agentsRef.current.forEach(a => {
+            ctx.fillStyle = successRef.current ? '#94a3b8' : a.roleColor;
+            ctx.beginPath(); ctx.arc(a.x, a.y, AGENT_RADIUS, 0, Math.PI*2); ctx.fill();
         });
-        ctx.fillStyle = successRef.current ? '#94a3b8' : '#22d3ee';
-        agentsRef.current.forEach(a => { ctx.beginPath(); ctx.arc(a.x, a.y, AGENT_RADIUS, 0, Math.PI*2); ctx.fill(); });
         
         animationId = requestAnimationFrame(loop);
     };
