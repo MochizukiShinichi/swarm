@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import policyData from '../policy.json';
 
 // --- GOLDEN PARITY CONSTANTS ---
 const WIDTH = 800.0;
@@ -42,16 +43,12 @@ export const usePhysics = () => {
   const policyRef = useRef<any>(null);
   const trailRef = useRef<Vector[]>([]);
 
-  // Load Policy
+  // Load Policy (bundled via Vite import - web/public/policy.json is gitignored)
   useEffect(() => {
-    fetch(import.meta.env.BASE_URL + 'policy.json')
-      .then(r => r.json())
-      .then(data => {
-          policyRef.current = data;
-          setBrainActive(true);
-          console.log("Phase 3 Policy (Attention) Loaded");
-      })
-      .catch(err => console.error("Failed to load policy.json", err));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    policyRef.current = policyData as any;
+    setBrainActive(true);
+    console.log("Phase 3 Policy (Attention) Loaded");
   }, []);
 
   useEffect(() => {
