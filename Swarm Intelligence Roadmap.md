@@ -74,13 +74,18 @@ Early stages demand the **highest** SR because the tasks are easiest. The bar dr
 | **2.0** | Brain | **Recurrent memory (GRU cell)** — MLP+GRU, hidden state size 16. Agents remember the last 10-20 steps. Enables anticipation. | ≥ 0.90 | ≥ 0.55 | ≥ 0.60 |
 | **2.1** | Brain | **Neighbor messaging** — Each agent broadcasts a 4-dim vector to neighbors within comm radius. Receive average neighborhood message. Foundation of coordination. | ≥ 0.90 | ≥ 0.60 | ≥ 0.65 |
 | **2.2** | World | **Static obstacles** — 2-4 circular pillars between object and target. | ≥ 0.90 | ≥ 0.45 | ≥ 0.55 |
-| **2.3** | World | **Sensor noise + motor delay** — Gaussian noise σ=0.05 on sensors. 2-step motor delay. First real-world constraint. | ≥ 0.90 | ≥ 0.40 | ≥ 0.50 |
+| 2.3 | World | **Sensor noise + motor delay** — Gaussian noise σ=0.05 on sensors. 2-step motor delay. First real-world constraint. | ≥ 0.90 | ≥ 0.40 | ≥ 0.50 |
 
-**What you'll see:** Agents form distinct formations. C-wrap becomes deliberate. "Scouts" and "pushers" emerge. Path-planning through gaps appears.
+### Phase 2 V&V Protocol (Mandatory)
+*   **[Automated] Memory Test:** Run `tests/memory_check.py`. Agents must demonstrate "delayed reaction" (moving toward a target that has disappeared) if hidden states are working.
+*   **[Automated] Messaging Test:** Run `tests/comm_check.py`. Check if agent A's output message appears in agent B's input message in the next step.
+*   **[Empirical] 2K Marathon:** Run `main.py` for 2,000 generations. **Pass Criteria:** `SR` must reach ≥ 0.90 at Difficulty 0.6 (obstacles active) within this window.
+*   **[Visual] Formation Test:** In the web evaluator, agents must form a clear "pushing arc" that persists even if the object is temporarily obscured.
 
 ---
 
 ## Phase 3: Learn to Coordinate
+
 
 > The swarm can push, think, and communicate. Create pressure for specialization.
 
