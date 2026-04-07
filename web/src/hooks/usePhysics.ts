@@ -44,7 +44,7 @@ export const usePhysics = () => {
 
   // Load Policy
   useEffect(() => {
-    fetch('policy.json')
+    fetch(import.meta.env.BASE_URL + 'policy.json')
       .then(r => r.json())
       .then(data => {
           policyRef.current = data;
