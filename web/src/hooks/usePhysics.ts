@@ -98,15 +98,17 @@ export const usePhysics = () => {
                 gridVX[idx] += a.vx; gridVY[idx] += a.vy;
                 gridCount[idx]++;
                 
-                // Broadcast K, V (Stage 3.0)
-                for (let k = 0; k < 4; k++) {
-                    let kv = 0, vv = 0;
-                    for (let m = 0; m < 4; m++) {
-                        kv += a.msg[m] * policy.w_attn_k[m][k];
-                        vv += a.msg[m] * policy.w_attn_v[m][k];
+                // Broadcast K, V (Stage 3.0 - skip if Phase 2 policy)
+                if (policy.w_attn_k) {
+                    for (let k = 0; k < 4; k++) {
+                        let kv = 0, vv = 0;
+                        for (let m = 0; m < 4; m++) {
+                            kv += a.msg[m] * policy.w_attn_k[m][k];
+                            vv += a.msg[m] * policy.w_attn_v[m][k];
+                        }
+                        gridK[idx * 4 + k] += kv;
+                        gridV[idx * 4 + k] += vv;
                     }
-                    gridK[idx * 4 + k] += kv;
-                    gridV[idx * 4 + k] += vv;
                 }
                 
                 // Linked List for Broadphase
@@ -140,17 +142,20 @@ export const usePhysics = () => {
                 const avgVX = count > 0 ? sumVX / count : 0;
                 const avgVY = count > 0 ? sumVY / count : 0;
                 
-                // Attention Context (Stage 3.0)
-                let query = [0,0,0,0];
-                for (let j = 0; j < 4; j++) {
-                    let val = 0;
-                    for (let k = 0; k < 16; k++) val += agent.h[k] * policy.w_attn_q[k][j];
-                    query[j] = Math.tanh(val);
+                // Attention Context (Stage 3.0 - fallback to zeros if Phase 2 policy)
+                let attnCtx = [0, 0, 0, 0];
+                if (policy.w_attn_q) {
+                    const query = [0,0,0,0];
+                    for (let j = 0; j < 4; j++) {
+                        let val = 0;
+                        for (let k = 0; k < 16; k++) val += agent.h[k] * policy.w_attn_q[k][j];
+                        query[j] = Math.tanh(val);
+                    }
+                    let score = 0;
+                    for (let k = 0; k < 4; k++) score += query[k] * (sumK[k] / Math.max(1, count));
+                    const weight = sigmoid(score);
+                    attnCtx = sumV.map(v => weight * (v / Math.max(1, count)));
                 }
-                let score = 0;
-                for (let k = 0; k < 4; k++) score += query[k] * (sumK[k] / Math.max(1, count));
-                const weight = sigmoid(score);
-                const attnCtx = sumV.map(v => weight * (v / Math.max(1, count)));
 
                 // Sensors
                 const toT = normalize({ x: target.x - obj.x, y: target.y - obj.y });
