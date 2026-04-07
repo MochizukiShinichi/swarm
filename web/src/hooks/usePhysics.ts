@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import policyData from '../../public/policy.json';
 
 // --- GOLDEN PARITY CONSTANTS ---
 const WIDTH = 800.0;
@@ -43,16 +44,13 @@ export const usePhysics = () => {
 
   // Load Policy from public/policy.json (Live parity)
   useEffect(() => {
-    fetch('policy.json') // Relative to base
-      .then(r => r.json())
-      .then(data => {
-          policyRef.current = data;
-          setBrainActive(true);
-          console.log("Phase 2 Policy Loaded via Fetch");
-      })
-      .catch(err => {
-          console.error("Failed to load policy.json. Ensure it exists in web/public/", err);
-      });
+    try {
+      policyRef.current = policyData;
+      setBrainActive(true);
+      console.log("Phase 2 Policy Loaded via Import");
+    } catch (err) {
+      console.error("Failed to load policy data.", err);
+    }
   }, []);
 
   useEffect(() => {
