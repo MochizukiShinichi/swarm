@@ -95,18 +95,13 @@ def train():
             print(f"Gen {gen:05d} | SR: {mean_sr:.3f} | EF: {mean_ef:.3f} | CO: {mean_co:.3f} | Fit: {max_fit:.1f} | Diff: {difficulty:.2f}")
             engine.export_policy(optimizer.weights, "web/public/policy.json")
 
-        # 7. Metric-Gated Curriculum (Stage 1.2 & 2.x)
+        # 7. Metric-Gated Curriculum (Task 3: Mastery-Based Gating)
         if len(rolling_sr) == window_size:
-            # Phase thresholds change as difficulty increases
-            target_sr = 0.95 if difficulty < 0.3 else 0.90
-            target_ef = 0.50 if difficulty < 0.3 else 0.45
-            target_co = 0.60 if difficulty < 0.3 else 0.55
-            
-            if mean_sr >= target_sr and mean_ef >= target_ef and mean_co >= target_co:
-                if difficulty < 1.0:
-                    difficulty += 0.1
-                    print(f">>> MASTERY REACHED! Difficulty Increased to {difficulty:.2f} <<<")
-                    rolling_sr, rolling_ef, rolling_co = [], [], []
+            if mean_sr >= 0.75 and mean_ef >= 0.50 and mean_co >= 0.30:
+                difficulty += 0.1
+                print(f">>> MASTERY REACHED! Difficulty Increased to {difficulty:.2f} <<<")
+                rolling_sr, rolling_ef, rolling_co = [], [], []
+                plateau_counter = 0
 
         # 8. Plateau Detection
         if plateau_counter > 200:
