@@ -44,13 +44,21 @@ export const usePhysics = () => {
 
   // Load Policy from public/policy.json (Live parity)
   useEffect(() => {
-    try {
-      policyRef.current = policyData;
-      setBrainActive(true);
-      console.log("Phase 2 Policy Loaded via Import");
-    } catch (err) {
-      console.error("Failed to load policy data.", err);
-    }
+    const loadPolicy = async () => {
+        try {
+            const res = await fetch('/policy.json');
+            const data = await res.json();
+            policyRef.current = data;
+            setBrainActive(true);
+            console.log("Policy Loaded via Fetch (Live)");
+        } catch (err) {
+            console.error("Failed to fetch policy data.", err);
+        }
+    };
+    loadPolicy();
+    // Refresh every 30s to catch new checkpoints
+    const interval = setInterval(loadPolicy, 30000);
+    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {

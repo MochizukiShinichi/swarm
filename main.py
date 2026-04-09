@@ -109,7 +109,7 @@ def train():
             plateau_counter = 0
             
     print("TRAINING COMPLETE.")
-    engine.export_policy(optimizer.weights, "web/src/assets/policy.json")
+    engine.export_policy(optimizer.weights, "web/public/policy.json")
 
 if __name__ == "__main__":
     train()
