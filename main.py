@@ -29,12 +29,26 @@ def train():
         
         # 4. Run episode
         engine.initialize_episode(difficulty)
+        last_obj_pos = engine.obj_pos.to_numpy()
+        stagnation_counters = np.zeros(engine.NUM_ENVS)
+        stuck_envs = np.zeros(engine.NUM_ENVS)
+
         for t in range(engine.EPISODE_STEPS):
             engine.update_grid()
             engine.step(t)
             
+            # Stagnation Detection (Task 2)
+            if t % 50 == 0 and t > 0:
+                curr_obj_pos = engine.obj_pos.to_numpy()
+                if t > 200:
+                    dist_moved = np.linalg.norm(curr_obj_pos - last_obj_pos, axis=1)
+                    stagnation_counters = np.where(dist_moved < 2.0, stagnation_counters + 1, 0)
+                    stuck_envs = np.where(stagnation_counters >= 3, 1.0, stuck_envs)
+                last_obj_pos = curr_obj_pos
+            
         # 5. Get raw results and reduce across trials
         raw_fitness, raw_reached = engine.get_fitness()
+        raw_fitness -= stuck_envs * 500.0 # Trap Penalty (Task 2)
         fitness = raw_fitness.reshape(engine.POP_SIZE, engine.TRIALS_PER_CANDIDATE).mean(axis=1)
         reached = raw_reached.reshape(engine.POP_SIZE, engine.TRIALS_PER_CANDIDATE).mean(axis=1)
         
