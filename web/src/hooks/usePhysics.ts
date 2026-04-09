@@ -40,6 +40,7 @@ export const usePhysics = () => {
   const obstaclesRef = useRef<{x: number, y: number, active: boolean}[]>([]);
   const targetRef = useRef<Vector | null>(null);
   const policyRef = useRef<any>(null);
+  const difficultyRef = useRef(0.0);
   const trailRef = useRef<Vector[]>([]);
 
   // Load Policy from public/policy.json (Live parity)
@@ -49,8 +50,11 @@ export const usePhysics = () => {
             const res = await fetch('/policy.json');
             const data = await res.json();
             policyRef.current = data;
+            if (data.meta && data.meta.difficulty !== undefined) {
+                difficultyRef.current = data.meta.difficulty;
+            }
             setBrainActive(true);
-            console.log("Policy Loaded via Fetch (Live)");
+            console.log("Policy Loaded via Fetch (Live). Difficulty:", difficultyRef.current);
         } catch (err) {
             console.error("Failed to fetch policy data.", err);
         }
@@ -91,6 +95,7 @@ export const usePhysics = () => {
         const target = targetRef.current;
         const policy = policyRef.current;
         const obstacles = obstaclesRef.current;
+        const diff = difficultyRef.current;
 
         if (target && policy && !successRef.current) {
             // Local Consensus
@@ -191,9 +196,12 @@ export const usePhysics = () => {
                 }
 
                 const fCurrent = { x: out[0] * 0.02, y: out[1] * 0.02 };
-                const fDelayed = agent.motorQueue[1];
-                agent.motorQueue[1] = agent.motorQueue[0];
-                agent.motorQueue[0] = fCurrent;
+                let fDelayed = fCurrent;
+                if (diff > 0.6) {
+                    fDelayed = agent.motorQueue[1];
+                    agent.motorQueue[1] = agent.motorQueue[0];
+                    agent.motorQueue[0] = fCurrent;
+                }
                 agent.vx += (fDelayed.x / AGENT_MASS) * DT;
                 agent.vy += (fDelayed.y / AGENT_MASS) * DT;
                 for (let k = 0; k < 4; k++) agent.msg[k] = out[2+k];
@@ -299,18 +307,45 @@ export const usePhysics = () => {
       targetRef.current = { x: nx, y: ny }; 
       successRef.current = false; setSuccess(false); 
       trailRef.current = [];
+
+      const obj = objPosRef.current;
+      const diff = difficultyRef.current;
+
+      // Align agent spawn side with engine logic
+      const dx_real = nx - obj.x, dy_real = ny - obj.y;
+      const dist_real = Math.sqrt(dx_real*dx_real + dy_real*dy_real) + 1e-5;
+      const scX = obj.x - (dx_real / dist_real) * 60.0;
+      const scY = obj.y - (dy_real / dist_real) * 60.0;
+
       agentsRef.current.forEach(a => {
+          a.x = scX + (Math.random()-0.5) * 80.0;
+          a.y = scY + (Math.random()-0.5) * 80.0;
+          a.vx = 0; a.vy = 0;
           a.h = new Array(16).fill(0); a.msg = new Array(4).fill(0);
           a.motorQueue = [{x:0, y:0}, {x:0, y:0}];
       });
+
       const obs = [];
-      const dx = nx - 400, dy = ny - 250;
+      const dx = nx - obj.x, dy = ny - obj.y;
       const dist = Math.sqrt(dx*dx + dy*dy) + 1e-5;
-      for (let i = 0; i < 3; i++) {
-          const t = 0.3 + 0.4 * Math.random();
-          const midX = 400 + dx * t, midY = 250 + dy * t;
-          const px = -dy/dist, py = dx/dist;
-          obs.push({ x: midX + px * (Math.random()-0.5) * 200, y: midY + py * (Math.random()-0.5) * 200, active: true });
+      
+      let numObs = 0;
+      if (diff > 0.3) numObs = 2;
+      if (diff > 0.6) numObs = 4;
+
+      for (let i = 0; i < 4; i++) {
+          if (i < numObs) {
+              const t = 0.3 + 0.4 * Math.random();
+              const midX = obj.x + dx * t, midY = obj.y + dy * t;
+              const px = -dy/dist, py = dx/dist;
+              obs.push({ 
+                  x: midX + px * (Math.random()-0.5) * 150.0, 
+                  y: midY + py * (Math.random()-0.5) * 150.0, 
+                  active: true 
+              });
+          } else {
+              obs.push({ x: 0, y: 0, active: false });
+          }
       }
       obstaclesRef.current = obs;
   };

@@ -291,7 +291,7 @@ def load_weights(pop):
     w2.from_numpy(pop[:, ptr:ptr+RNN_DIM*OUT_DIM].reshape(NUM_ENVS, RNN_DIM, OUT_DIM)); ptr += RNN_DIM*OUT_DIM
     b2.from_numpy(pop[:, ptr:ptr+OUT_DIM]); ptr += OUT_DIM
 
-def export_policy(weights, path):
+def export_policy(weights, path, meta=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     ptr = 0
     d = {}
@@ -302,6 +302,8 @@ def export_policy(weights, path):
     d["b_gru"] = weights[ptr:ptr+3*RNN_DIM].reshape(3, RNN_DIM).tolist(); ptr += 3*RNN_DIM
     d["w2"] = weights[ptr:ptr+RNN_DIM*OUT_DIM].reshape(RNN_DIM, OUT_DIM).tolist(); ptr += RNN_DIM*OUT_DIM
     d["b2"] = weights[ptr:ptr+OUT_DIM].tolist()
+    if meta is not None:
+        d["meta"] = meta
     with open(path, "w") as f: json.dump(d, f)
 
 def get_fitness():

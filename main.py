@@ -93,7 +93,11 @@ def train():
 
         if gen % 100 == 0:
             print(f"Gen {gen:05d} | SR: {mean_sr:.3f} | EF: {mean_ef:.3f} | CO: {mean_co:.3f} | Fit: {max_fit:.1f} | Diff: {difficulty:.2f}")
-            engine.export_policy(optimizer.weights, "web/public/policy.json")
+            engine.export_policy(optimizer.weights, "web/public/policy.json", {
+                "difficulty": float(difficulty),
+                "gen": int(gen),
+                "mean_sr": float(mean_sr)
+            })
 
         # 7. Metric-Gated Curriculum (Task 3: Mastery-Based Gating)
         if len(rolling_sr) == window_size:
@@ -109,7 +113,11 @@ def train():
             plateau_counter = 0
             
     print("TRAINING COMPLETE.")
-    engine.export_policy(optimizer.weights, "web/public/policy.json")
+    engine.export_policy(optimizer.weights, "web/public/policy.json", {
+        "difficulty": float(difficulty),
+        "gen": int(gen),
+        "mean_sr": float(mean_sr)
+    })
 
 if __name__ == "__main__":
     train()
