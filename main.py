@@ -3,9 +3,9 @@ import engine
 from optimizer import OpenAI_ES
 
 def train():
-    print(f"STARTING SWARM INTELLIGENCE TRAINING: {engine.NUM_ENVS} ENVS")
+    print(f"STARTING SWARM INTELLIGENCE TRAINING: {engine.NUM_ENVS} ENVS ({engine.POP_SIZE} POP x {engine.TRIALS_PER_CANDIDATE} TRIALS)")
     
-    optimizer = OpenAI_ES(engine.PARAM_COUNT, engine.NUM_ENVS)
+    optimizer = OpenAI_ES(engine.PARAM_COUNT, engine.POP_SIZE)
     
     best_all_time_fit = -999999.0
     plateau_counter = 0
@@ -21,21 +21,28 @@ def train():
         # 1. Ask optimizer for population
         population = optimizer.ask()
         
-        # 2. Load weights into engine
-        engine.load_weights(population)
+        # 2. Tile population for multi-trial evaluation
+        eval_population = np.repeat(population, engine.TRIALS_PER_CANDIDATE, axis=0)
         
-        # 3. Run episode
+        # 3. Load weights into engine
+        engine.load_weights(eval_population)
+        
+        # 4. Run episode
         engine.initialize_episode(difficulty)
         for t in range(engine.EPISODE_STEPS):
             engine.update_grid()
             engine.step(t)
             
-        # 4. Get fitness and metrics
-        fitness, reached = engine.get_fitness()
+        # 5. Get raw results and reduce across trials
+        raw_fitness, raw_reached = engine.get_fitness()
+        fitness = raw_fitness.reshape(engine.POP_SIZE, engine.TRIALS_PER_CANDIDATE).mean(axis=1)
+        reached = raw_reached.reshape(engine.POP_SIZE, engine.TRIALS_PER_CANDIDATE).mean(axis=1)
+        
         sr = np.mean(reached)
         
         # Efficiency (Stage 1.2): 1 - mean(success_time / EPISODE_STEPS) for successful envs
-        success_indices = np.where(reached == 1)[0]
+        # Note: raw_reached used here to match original success_time indexing
+        success_indices = np.where(raw_reached == 1)[0]
         ef = 0.0
         if len(success_indices) > 0:
             ef = 1.0 - np.mean(engine.success_time.to_numpy()[success_indices] / engine.EPISODE_STEPS)

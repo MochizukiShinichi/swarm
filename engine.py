@@ -8,9 +8,12 @@ ti.init(arch=ti.gpu, device_memory_GB=2.0, unrolling_limit=0)
 
 # --- CONFIGURATION ---
 WIDTH, HEIGHT = 800.0, 500.0
-NUM_ENVS, NUM_PARTICLES = 256, 100
+NUM_ENVS, NUM_PARTICLES = 1024, 100
+POP_SIZE = 256
+TRIALS_PER_CANDIDATE = 4
 DT = 1.0
 EPISODE_STEPS = 600
+assert NUM_ENVS == POP_SIZE * TRIALS_PER_CANDIDATE
 
 # Continuous Contact Physics
 FRICTION_AIR = 0.05
