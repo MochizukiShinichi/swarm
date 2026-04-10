@@ -32,7 +32,6 @@ dist/
 .env.local
 
 # Project Specific
-web/public/policy.json
 *.txt
 *.log
 .gemini/

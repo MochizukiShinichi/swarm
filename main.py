@@ -11,6 +11,15 @@ def train():
     plateau_counter = 0
     difficulty = 0.0
     
+    # Resume from saved policy if available
+    saved_weights, meta = engine.import_policy(engine.POLICY_PATH)
+    if saved_weights is not None:
+        print(f">>> RESUMING FROM SAVED WEIGHTS ({engine.POLICY_PATH}) <<<")
+        optimizer.weights = saved_weights
+        if meta and "difficulty" in meta:
+            difficulty = meta["difficulty"]
+            print(f">>> Resumed Difficulty: {difficulty:.2f} <<<")
+    
     # Mastery Metrics (Stage 1.2)
     rolling_sr = []
     rolling_ef = []
@@ -93,7 +102,7 @@ def train():
 
         if gen % 100 == 0:
             print(f"Gen {gen:05d} | SR: {mean_sr:.3f} | EF: {mean_ef:.3f} | CO: {mean_co:.3f} | Fit: {max_fit:.1f} | Diff: {difficulty:.2f}")
-            engine.export_policy(optimizer.weights, "web/public/policy.json", {
+            engine.export_policy(optimizer.weights, engine.POLICY_PATH, {
                 "difficulty": float(difficulty),
                 "gen": int(gen),
                 "mean_sr": float(mean_sr)
@@ -113,7 +122,7 @@ def train():
             plateau_counter = 0
             
     print("TRAINING COMPLETE.")
-    engine.export_policy(optimizer.weights, "web/public/policy.json", {
+    engine.export_policy(optimizer.weights, engine.POLICY_PATH, {
         "difficulty": float(difficulty),
         "gen": int(gen),
         "mean_sr": float(mean_sr)

@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import policyData from '../policy.json';
 
 // --- GOLDEN PARITY CONSTANTS ---
 const WIDTH = 800.0;
@@ -17,6 +16,38 @@ const K_OBJ = 0.05;
 const K_OBS = 0.1;
 
 interface Vector { x: number; y: number; }
+
+// Canonical runtime policy location:
+// - trainer reads/writes `web/public/policy.json`
+// - Vite dev server serves it at `${BASE_URL}policy.json`
+// - production builds copy that file into `dist/policy.json`
+const LEGACY_PHASE2_FALLBACK_DIFFICULTY = 0.7;
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const obstacleCountForDifficulty = (diff: number) => {
+    let numObs = 0;
+    if (diff > 0.3) numObs = 2;
+    if (diff > 0.6) numObs = 4;
+    return numObs;
+};
+
+const inferDifficultyFromPolicy = (policy: any) => {
+    const metaDifficulty = Number(policy?.meta?.difficulty);
+    if (Number.isFinite(metaDifficulty)) {
+        return clamp(metaDifficulty, 0.0, 1.0);
+    }
+
+    // Legacy phase-2 checkpoints were exported without meta.difficulty.
+    // We cannot recover the true curriculum state from the file itself, so
+    // use the current trained difficulty rather than silently evaluating
+    // obstacle-free.
+    if (Array.isArray(policy?.w1) && policy.w1.length === 22) {
+        return LEGACY_PHASE2_FALLBACK_DIFFICULTY;
+    }
+
+    return 0.0;
+};
 
 const normalize = (v: Vector): Vector => {
     const mag = Math.sqrt(v.x * v.x + v.y * v.y);
@@ -43,36 +74,91 @@ export const usePhysics = () => {
   const difficultyRef = useRef(0.0);
   const trailRef = useRef<Vector[]>([]);
 
+  const clearObstacles = () => {
+      obstaclesRef.current = Array.from({ length: 4 }, () => ({ x: 0, y: 0, active: false }));
+  };
+
+  const generateObstacles = (diff: number, obj: Vector, target: Vector | null) => {
+      if (!target) {
+          clearObstacles();
+          return;
+      }
+
+      const obs = [];
+      const numObs = obstacleCountForDifficulty(diff);
+      const dx = target.x - obj.x, dy = target.y - obj.y;
+      const dist = Math.sqrt(dx*dx + dy*dy) + 1e-5;
+
+      for (let i = 0; i < 4; i++) {
+          if (i < numObs) {
+              const t = 0.3 + 0.4 * Math.random();
+              const midX = obj.x + dx * t, midY = obj.y + dy * t;
+              const px = -dy/dist, py = dx/dist;
+              obs.push({ 
+                  x: midX + px * (Math.random()-0.5) * 150.0, 
+                  y: midY + py * (Math.random()-0.5) * 150.0, 
+                  active: true 
+              });
+          } else {
+              obs.push({ x: 0, y: 0, active: false });
+          }
+      }
+      obstaclesRef.current = obs;
+  };
+
+  const parkAgents = () => {
+      const obj = objPosRef.current;
+      const cols = 10;
+      const spacing = 12;
+      const startX = obj.x - ((cols - 1) * spacing) / 2;
+      const startY = obj.y + 70;
+
+      agentsRef.current.forEach((a, i) => {
+          const row = Math.floor(i / cols);
+          const col = i % cols;
+          a.x = startX + col * spacing;
+          a.y = startY + row * spacing;
+          a.vx = 0;
+          a.vy = 0;
+          a.h = new Array(16).fill(0);
+          a.msg = new Array(4).fill(0);
+          a.motorQueue = [{x:0, y:0}, {x:0, y:0}];
+      });
+  };
+
   // Load Policy from public/policy.json (Live parity)
   useEffect(() => {
     const loadPolicy = async () => {
         try {
-            const res = await fetch('/policy.json');
+            const res = await fetch(`${import.meta.env.BASE_URL}policy.json?t=${Date.now()}`);
             const data = await res.json();
             policyRef.current = data;
-            if (data.meta && data.meta.difficulty !== undefined) {
-                difficultyRef.current = data.meta.difficulty;
+            difficultyRef.current = inferDifficultyFromPolicy(data);
+            if (targetRef.current) {
+                generateObstacles(difficultyRef.current, objPosRef.current, targetRef.current);
+            } else {
+                clearObstacles();
             }
             setBrainActive(true);
-            console.log("Policy Loaded via Fetch (Live). Difficulty:", difficultyRef.current);
+            if (data?.meta?.difficulty === undefined) {
+                console.warn(`Policy loaded without meta.difficulty; using fallback difficulty ${difficultyRef.current.toFixed(2)} for web evaluation.`);
+            } else {
+                console.log("Policy Loaded. Difficulty:", difficultyRef.current);
+            }
         } catch (err) {
             console.error("Failed to fetch policy data.", err);
         }
     };
     loadPolicy();
-    // Refresh every 30s to catch new checkpoints
     const interval = setInterval(loadPolicy, 30000);
     return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
-    // 1. Init
     const initialAgents = [];
     for (let i = 0; i < 100; i++) {
-        const angle = Math.random() * 2.0 * Math.PI;
-        const r = 60.0 + Math.random() * 40.0;
         initialAgents.push({
-            x: 400 + Math.cos(angle) * r, y: 250 + Math.sin(angle) * r,
+            x: 0, y: 0,
             vx: 0, vy: 0,
             h: new Array(16).fill(0),
             msg: new Array(4).fill(0),
@@ -80,9 +166,9 @@ export const usePhysics = () => {
         });
     }
     agentsRef.current = initialAgents;
-    obstaclesRef.current = [];
+    parkAgents();
+    clearObstacles();
 
-    // 2. Loop
     let animationId: number;
     const loop = () => {
         const ctx = canvasRef.current?.getContext('2d');
@@ -97,7 +183,7 @@ export const usePhysics = () => {
         const obstacles = obstaclesRef.current;
         const diff = difficultyRef.current;
 
-        if (target && policy && !successRef.current) {
+        if (policy && target && !successRef.current) {
             // Local Consensus
             const gridVX = new Float32Array(40 * 40);
             const gridVY = new Float32Array(40 * 40);
@@ -115,8 +201,10 @@ export const usePhysics = () => {
             });
 
             // Trail
-            trailRef.current.push({ x: obj.x, y: obj.y });
-            if (trailRef.current.length > 300) trailRef.current.shift();
+            if (target) {
+                trailRef.current.push({ x: obj.x, y: obj.y });
+                if (trailRef.current.length > 300) trailRef.current.shift();
+            }
 
             agentsRef.current.forEach((agent) => {
                 const gx = Math.max(0, Math.min(39, Math.floor(agent.x / 20)));
@@ -141,7 +229,7 @@ export const usePhysics = () => {
                 const avgMsg = sumMsg.map(m => count > 0 ? m / count : 0);
 
                 // Sensors
-                const toT = normalize({ x: target.x - obj.x, y: target.y - obj.y });
+                const toT = target ? normalize({ x: target.x - obj.x, y: target.y - obj.y }) : { x: 0, y: 0 };
                 const dO = { x: obj.x - agent.x, y: obj.y - agent.y };
                 const distO = Math.sqrt(dO.x * dO.x + dO.y * dO.y);
                 const toO = normalize(dO);
@@ -260,7 +348,7 @@ export const usePhysics = () => {
             obj.x += obj.vx * DT; obj.y += obj.vy * DT;
             if (obj.x < OBJ_SIZE) { obj.x = OBJ_SIZE; obj.vx *= -0.5; } if (obj.x > WIDTH - OBJ_SIZE) { obj.x = WIDTH - OBJ_SIZE; obj.vx *= -0.5; }
             if (obj.y < OBJ_SIZE) { obj.y = OBJ_SIZE; obj.vy *= -0.5; } if (obj.y > HEIGHT - OBJ_SIZE) { obj.y = HEIGHT - OBJ_SIZE; obj.vy *= -0.5; }
-            if (Math.sqrt((obj.x - target.x)**2 + (obj.y - target.y)**2) < 40.0) { successRef.current = true; setSuccess(true); }
+            if (target && Math.sqrt((obj.x - target.x)**2 + (obj.y - target.y)**2) < 40.0) { successRef.current = true; setSuccess(true); }
         }
 
         // RENDER
@@ -325,39 +413,15 @@ export const usePhysics = () => {
           a.motorQueue = [{x:0, y:0}, {x:0, y:0}];
       });
 
-      const obs = [];
-      const dx = nx - obj.x, dy = ny - obj.y;
-      const dist = Math.sqrt(dx*dx + dy*dy) + 1e-5;
-      
-      let numObs = 0;
-      if (diff > 0.3) numObs = 2;
-      if (diff > 0.6) numObs = 4;
-
-      for (let i = 0; i < 4; i++) {
-          if (i < numObs) {
-              const t = 0.3 + 0.4 * Math.random();
-              const midX = obj.x + dx * t, midY = obj.y + dy * t;
-              const px = -dy/dist, py = dx/dist;
-              obs.push({ 
-                  x: midX + px * (Math.random()-0.5) * 150.0, 
-                  y: midY + py * (Math.random()-0.5) * 150.0, 
-                  active: true 
-              });
-          } else {
-              obs.push({ x: 0, y: 0, active: false });
-          }
-      }
-      obstaclesRef.current = obs;
+      generateObstacles(diff, obj, targetRef.current);
   };
 
   const resetEnv = () => {
       objPosRef.current = { x: 400, y: 250, vx: 0, vy: 0 };
       successRef.current = false; setSuccess(false);
-      targetRef.current = null; trailRef.current = []; obstaclesRef.current = [];
-      agentsRef.current.forEach(a => {
-          a.h = new Array(16).fill(0); a.msg = new Array(4).fill(0);
-          a.motorQueue = [{x:0, y:0}, {x:0, y:0}];
-      });
+      targetRef.current = null; trailRef.current = [];
+      clearObstacles();
+      parkAgents();
   };
 
   return { canvasRef, setTarget, resetEnv, agentCount: 100, brainActive, success };

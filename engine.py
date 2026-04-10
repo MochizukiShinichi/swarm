@@ -3,6 +3,8 @@ import numpy as np
 import json
 import os
 
+POLICY_PATH = os.path.join("web", "public", "policy.json")
+
 # Use GPU
 ti.init(arch=ti.gpu, device_memory_GB=2.0, unrolling_limit=0)
 
@@ -290,6 +292,24 @@ def load_weights(pop):
     b_gru.from_numpy(pop[:, ptr:ptr+3*RNN_DIM].reshape(NUM_ENVS, 3, RNN_DIM)); ptr += 3*RNN_DIM
     w2.from_numpy(pop[:, ptr:ptr+RNN_DIM*OUT_DIM].reshape(NUM_ENVS, RNN_DIM, OUT_DIM)); ptr += RNN_DIM*OUT_DIM
     b2.from_numpy(pop[:, ptr:ptr+OUT_DIM]); ptr += OUT_DIM
+
+def import_policy(path):
+    if not os.path.exists(path): return None, None
+    with open(path, "r") as f: d = json.load(f)
+    weights = np.zeros(PARAM_COUNT, dtype=np.float32)
+    ptr = 0
+    def load_arr(k):
+        nonlocal ptr
+        w = np.array(d[k], dtype=np.float32).flatten()
+        weights[ptr:ptr+len(w)] = w
+        ptr += len(w)
+    try:
+        load_arr("w1"); load_arr("b1")
+        load_arr("w_gru_x"); load_arr("w_gru_h"); load_arr("b_gru")
+        load_arr("w2"); load_arr("b2")
+    except KeyError:
+        return None, None
+    return weights, d.get("meta")
 
 def export_policy(weights, path, meta=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
